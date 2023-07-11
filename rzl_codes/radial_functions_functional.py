@@ -8,10 +8,6 @@ from scipy.spatial import Voronoi, ConvexHull
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 
-import time
-
-# from codes import gen_functions
-
 """
 Python functions for processing + manipulation of radially acquired data. Should be as generally 
 applicable as possible.
@@ -70,6 +66,29 @@ def read_raw_data(path, data_shape, stored_shape=None, dims=('views', 'slices', 
     return raw_data
 
 
+def polar_coords_to_cartesian(polar_coords, angle_units='rad'):
+    """
+    Returns cartesian_coords, a 2D numpy array shape (total points, 2) where each row [x, y] are the cartesian
+    coordinates for the inputted radial coordinates.
+    Inputs:
+        - polar_coords: 2D numpy array shape (total points, 2) with polar coordinates (radius, theta)
+        - angle_units: units for polar coordinates. Either 'rad' for radians or 'deg' for degrees
+    Outputs:
+        -
+    """
+    if angle_units == 'rad':
+        pass
+    elif angle_units == 'deg':
+        polar_coords[:, 0] = polar_coords[:, 0] * np.pi / 180
+    else:
+        sys.exit('angle_units argument must be either "rad" or "deg".')
+
+    cartesian_coords = np.array([polar_coords[:, 0] * np.cos(polar_coords[:, 1]),  # x
+                                 polar_coords[:, 0] * np.sin(polar_coords[:, 1])]).T  # y
+
+    return cartesian_coords
+
+
 def get_voronoi_weights(n_views, xres_ro, n_slices=None, angles=None, golden_angle=False, zerofill_factor=1):
     """
     Returns voronoi weights for radially acquired data for density compensation.
@@ -88,21 +107,14 @@ def get_voronoi_weights(n_views, xres_ro, n_slices=None, angles=None, golden_ang
         angles = get_angle_array(n_views, golden_angle=golden_angle)
 
     xres_ro = int(xres_ro * zerofill_factor)
-
     x = np.arange(xres_ro) - xres_ro // 2
-    kx_all = []
-    ky_all = []
 
-    # Cartesian coordinates for each point
-    for angle in angles:
-        kx = x * np.cos(angle)
-        ky = x * np.sin(angle)
-        kx_all = kx_all + list(kx)
-        ky_all = ky_all + list(ky)
-    kxy = np.asarray(list(zip(kx_all, ky_all)))
+    # Create an numpy array shape (points*views, 2) with polar coordinates for sampling scheme
+    rad_coords = np.array(np.meshgrid(x, angles)).reshape((2, -1)).T
+    cart_coords = polar_coords_to_cartesian(rad_coords, angle_units='rad')
 
     # Find voronoi weights
-    voronoi = Voronoi(kxy)
+    voronoi = Voronoi(cart_coords)
     weights = np.zeros(voronoi.npoints)
     for i, reg_num in enumerate(voronoi.point_region):
         indices = voronoi.regions[reg_num]
@@ -299,14 +311,14 @@ def get_gridding_matrix(n_views, xres_ro, image_matrix_size,
         - n_views: integer, number of views
         - xres_ro: integer, number of readout points
         - image_matrix_size: list length 2 with [xres, yres] for k-space to be re-gridded onto
-        - angles: 1D numpy array with angles, in radians, for each view. If None, is compuuted by get_angle_array()
+        - angles: 1D numpy array with angles, in radians, for each view. If None, is computed by get_angle_array()
         - golden_angle: boolean, fed to get_angle_array() if angles is None
         - M, L: Kaiser-Bessel kernel parameters
     Outputs:
         - gridding_matrix: 4D numpy array shape [views, xres_ro, yres, xres] to be used with tensordot function to
                            directly obtain cartesian k-space from radial k-space.
     """
-
+    # TODO: Seems like an instance of "grid_to_cartesian", any way to consolidate both?
     xres, yres = image_matrix_size
 
     if angles is None:
@@ -723,25 +735,3 @@ def corrected_cartesian_data(raw_data, matrix_size, angles=None, golden_angle=Fa
 
     return kgrid
 
-
-# gm = get_gridding_matrix(n_views=403, xres_ro=96, image_matrix_size=[96, 96])
-#
-# x = 1
-
-# raw_data = read_raw_data(
-#     path='/Users/miguel/Desktop/Penn/Zhou Lab/sinogram_ML/fid_M132',
-#     data_shape=[403, 80, 96, 2],
-#     stored_shape=[403, 80, 128, 2],
-# )
-#
-# img_zf = reconstruct_image(raw_data, [96, 96], zerofill_factor=2)
-# img = reconstruct_image(raw_data, [96, 96], zerofill_factor=1)
-# df = np.broadcast_to(deapodization_filter([96, 96]), (80, 96, 96))
-# df = df / np.amax(df)
-# df_img = np.divide(img, df)
-#
-# x = 1
-
-# sinogram = reconstruct_sinogram(raw_data, return_complex=True)
-#
-# sino_image = image_from_sinogram(sinogram, [96, 96], gridding_matrix=gm, zerofill_factor=2)
