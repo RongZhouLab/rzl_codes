@@ -98,11 +98,14 @@ def get_voronoi_weights(n_views, xres_ro, n_slices=None, angles=None, golden_ang
         - n_slices: integer, number of slices. If None, returns 2D data. Default is None.
         - angles: list or np.array containing angles of each view if not sampled using sequential or golden angles
         - golden_angle: boolean, whether golden angle sampling is used. Overrides "angles"
+        - polar_coords: np.array shape (total views, 2), containing polar coordinates for each of the points in the
+                        the sampling scheme as (radius, theta). Overwrites "angles" and "golden_angle"
         - zerofill_factor: integer, factor by which readout dimension will increase. Default is 1, or no zerofilling.
     Outputs:
         - weights: np.array shape [views, slices, readout] with density compensation weights.
                     If n_slices = None (default), 2D array shape [views, readout].
     """
+
     if angles is None:
         angles = get_angle_array(n_views, golden_angle=golden_angle)
 
@@ -122,17 +125,29 @@ def get_voronoi_weights(n_views, xres_ro, n_slices=None, angles=None, golden_ang
             weights[i] = np.inf
         else:
             weights[i] = ConvexHull(voronoi.vertices[indices]).volume
-    weights = np.reshape(weights, (n_views, xres_ro))
 
-    # need to divide center by number of views (overlapping points) and set the edge weights
-    weights[:, (xres_ro // 2)] = weights[:, (xres_ro // 2)] / n_views
-    weights[:, 0] = weights[:, 1] + (weights[:, 1] - weights[:, 2])  # use slope to determine end weights
-    weights[:, (xres_ro - 1)] = weights[:, (xres_ro - 2)] + (weights[:, (xres_ro - 2)] - weights[:, (xres_ro - 3)])
+    # need to divide center by number of points going through it (usually same as number of views)
+    zeros = np.where(~np.any(cart_coords, axis=1))[0]  # Produces numpy vector with indeces for rows equal to [0, 0] in cartesian coordinates
+    weights[zeros] = weights[zeros] / len(zeros)
+
+    # need to adjust weights of regions that don't have a voronoi volume (at the edge of k-space)
+    # for universality, simply uses the weight of the point closest to it.
+    infs = np.where(weights == np.inf)[0]
+    cc = cart_coords.copy()
+    cc[infs, :] = np.inf  # So that the "nearest weight" is not another np.inf
+    for i_inf in infs:
+        xy = cart_coords[i_inf]
+        weights[i_inf] = weights[np.argmin(np.linalg.norm((cc - xy), axis=1))]
+
+    weights = weights.reshape((n_views, xres_ro))
 
     if n_slices is not None:
         weights = weights[:, np.newaxis, :].repeat(n_slices, axis=1)  # Convert to same shape as 3D data
 
     return weights
+
+
+
 
 
 def get_angle_array(n_views, max_angle=2*np.pi, golden_angle=False):
