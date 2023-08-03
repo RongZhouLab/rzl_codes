@@ -1,8 +1,6 @@
 import numpy as np
 from inspect import signature
 from scipy.optimize import curve_fit
-import math
-import matplotlib.pyplot as plt
 
 def un_interleave(data, slice_axis):
     """

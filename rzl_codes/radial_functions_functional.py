@@ -1,5 +1,6 @@
 import os
 import sys
+import warnings
 import numpy as np
 import math
 import cmath
@@ -7,12 +8,14 @@ from scipy import signal
 from scipy.spatial import Voronoi, ConvexHull
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
+import time
 
 """
 Python functions for processing + manipulation of radially acquired data. Should be as generally 
 applicable as possible.
 """
 # TODO: 2D/3D functionality is confusing and might be problematic in the future, esp. with the 'n_slices' variable
+# TODO: Warnings print warning strings twice?
 
 def read_raw_data(path, data_shape, stored_shape=None, dims=('views', 'slices', 'readout', 'imaginary'),
                   stored_padding='fid', offset=0, dtype=np.int32):
@@ -108,7 +111,7 @@ def get_voronoi_weights(n_views, xres_ro, n_slices=None, angles=None, golden_ang
         angles = get_angle_array(n_views, golden_angle=golden_angle)
 
     xres_ro = int(xres_ro * zerofill_factor)
-    x = np.arange(xres_ro) - xres_ro // 2
+    x = np.arange(xres_ro) - xres_ro / 2
 
     # Create an numpy array shape (points*views, 2) with polar coordinates for sampling scheme
     rad_coords = np.array(np.meshgrid(x, angles)).reshape((2, -1)).T
@@ -134,7 +137,7 @@ def get_voronoi_weights_from_coords(coords, coord_system='polar', angle_units=No
     """
     if coord_system == 'polar':
         if angle_units is None:
-            print('Assuming inputted coordinates for voronoi weights are in polar coordinates and in radians')
+            warnings.warn('Assuming inputted coordinates for voronoi weights are in polar coordinates and in radians')
             angle_units = 'rad'
         coords = polar_coords_to_cartesian(coords, angle_units=angle_units)
     elif coord_system != 'cartesian':
@@ -150,9 +153,12 @@ def get_voronoi_weights_from_coords(coords, coord_system='polar', angle_units=No
         else:
             weights[i] = ConvexHull(voronoi.vertices[indices]).volume
 
-    # need to divide center by number of points going through it (usually same as number of views)
-    zeros = np.where(~np.any(coords, axis=1))[0]  # Produces numpy vector with indeces for rows equal to [0, 0] in cartesian coordinates
-    weights[zeros] = weights[zeros] / len(zeros)
+    # Divide repeated k-space points by the number of times it is repeated (important especially for center of k-space)
+    locs, counts = np.unique(coords, axis=0, return_counts=True)
+    repeated_coords = locs[counts > 1]
+    for repeated_coord in repeated_coords:
+        rep_idxs = np.argwhere(np.all(coords == repeated_coord, axis=1))
+        weights[rep_idxs] = weights[rep_idxs] / len(rep_idxs)
 
     # need to adjust weights of regions that don't have a voronoi volume (at the edge of k-space)
     # for universality, simply uses the weight of the point closest to it.
@@ -177,11 +183,38 @@ def get_angle_array(n_views, max_angle=2*np.pi, golden_angle=False):
         angles: 1D numpy array length n_views where angles[i] is angle in radians of the i'th view
     """
     if golden_angle:
-        angles = np.arange(n_views) * np.pi * (math.sqrt(5) - 1) / 2
+        angles = np.arange(n_views) * np.pi*(math.sqrt(5) - 1)/2
     else:
         angles = np.arange(n_views)/n_views * max_angle
 
+    angles = angles % (np.pi*2)  # So that angles are only between 0 and 2*pi, necessary for 0th order phase correction
+
     return angles
+
+
+def get_coord_array(n_views, xres_ro, angles=None, max_angle=2*np.pi, golden_angle=False,
+                    return_coord_system='polar', return_coord_origin='center'):
+
+    if angles is None:
+        angles = get_angle_array(n_views=n_views, max_angle=max_angle, golden_angle=golden_angle)
+    x = np.arange(xres_ro) - xres_ro / 2
+    coords = np.array(np.meshgrid(x, angles)).reshape((2, -1)).T
+
+    if return_coord_system == 'polar':
+        if return_coord_origin != 'center':
+            warnings.warn('Coordinate system origin must be at the center of k-space if returning in a polar coordinate'
+                          ' system.\nChanging "return_coord_origin" to "center".')
+    elif return_coord_system == 'cartesian':
+        coords = polar_coords_to_cartesian(polar_coords=coords, angle_units='rad')
+        if return_coord_origin == 'bottom left':
+            coords = coords + xres_ro/2
+        else:
+            sys.exit('If returning cartesian coordinate system, "return_coord_origin" must be either "center" (default) '
+                     'or "bottom left".')
+    else:
+        sys.exit('Argument "return_coord_system" must be either "polar" or "cartesian".')
+
+    return coords
 
 
 def get_frequency_offset(raw_data, angles=None, golden_angle=False, zerofill_factor=8):
@@ -209,7 +242,8 @@ def get_frequency_offset(raw_data, angles=None, golden_angle=False, zerofill_fac
 
     angles0_idxs = []  # Forward views
     angles180_idxs = []  # Reverse views
-    n_view_corrections = n_views // 2 - 5  # must be less than 1/2 total views
+    n_view_corrections = n_views // 2 - 3  # must be less than 1/2 total views
+
     for i_view in range(n_view_corrections):
         angle0 = angles[i_view]
         angle180_diff = angles - np.pi - angle0
@@ -217,6 +251,10 @@ def get_frequency_offset(raw_data, angles=None, golden_angle=False, zerofill_fac
             angle_180_idx = np.argmin(abs(angle180_diff))
             angles0_idxs.append(i_view)
             angles180_idxs.append(angle_180_idx)
+    if len(angles0_idxs) < n_views / 8:  # If only about 1/4 of the views had similarly oriented views in the opposite direction
+        print('Zeroth order phase/frequency offset correction skipped due to low number of pairs of views that are'
+              '180 degrees from each other.')
+        return 0.0
 
     profiles_0 = np.fft.fftshift(np.fft.fft(np.fft.fftshift(raw_data[angles0_idxs], axes=-1), axis=-1), axes=-1)
     profiles_180 = np.fft.fftshift(np.fft.fft(np.fft.fftshift(raw_data[angles180_idxs], axes=-1), axis=-1), axes=-1)
@@ -253,19 +291,21 @@ def get_kspace_centers(raw_data):
     return np.argmax(raw_data, axis=-1)
 
 
-def grid_to_cartesian(raw_data, image_matrix_size, angles=None, golden_angle=False, M=501, L=4):
+def grid_to_cartesian(raw_data, image_matrix_size, kspace_traj=None, angles=None, golden_angle=False, M=501, L=4):
     """
     Applies re-gridding of radially acquired points to a cartesian grid. Assumes that all the slices inputted
     require the same gridding scheme.
     Inputs:
         - raw_data: 2D or 3D numpy array with radial k-space data with dimensions [views, (slices), readout]
         - image_matrix_size: list length 2 with [xres, yres] for k-space to be re-gridded onto
-        - angles: 1D numpy array with angles, in radians, for each view. If None, is compuuted by get_angle_array()
+        - angles: 1D numpy array with angles, in radians, for each view. If None, is computed by get_angle_array()
         - golden_angle: boolean, fed to get_angle_array() if angles is None
         - M, L: Kaiser-Bessel kernel parameters
     Outputs:
         - kgrid: 2D or 3D numpy array shape [(slices), yres, xres]
     """
+    # TODO: Process of getting voronoi weights and using them is still very ugly; clean this up.
+    # TODO: Might be worth it to refactor code by using a [d1, d2, ..., view, xres] dimension shape as default.
     xres, yres = image_matrix_size
 
     if len(raw_data.shape) < 3:
@@ -274,56 +314,55 @@ def grid_to_cartesian(raw_data, image_matrix_size, angles=None, golden_angle=Fal
     else:
         n_slices = raw_data.shape[1]  # Value not used
 
-    n_views, _, xres_ro = raw_data.shape
+    if kspace_traj is None:
+        n_views, _, xres_ro = raw_data.shape
+        kspace_traj = get_coord_array(n_views, xres_ro,
+                                      angles=angles, golden_angle=golden_angle,
+                                      return_coord_system='cartesian', return_coord_origin='bottom left')  # Origin in bottom left necessary for filling in kgrid
+    voronoi_weights = get_voronoi_weights_from_coords(kspace_traj, coord_system='cartesian')
 
-    if angles is None:
-        angles = get_angle_array(n_views=n_views, golden_angle=golden_angle)
-    voronoi_weights = get_voronoi_weights(n_views=raw_data.shape[0],
-                                          xres_ro=raw_data.shape[-1],
-                                          n_slices=raw_data.shape[1],
-                                          angles=angles)
+    # Reshape raw_data so that it is the same shape as weights and kspace_traj
+    raw_data = raw_data.transpose((1, 0, 2))
+    raw_data = raw_data.reshape((raw_data.shape[0], -1))  # Might be better to do (-1, voronoi_weights.shape[0]) in the future?
+
+    voronoi_weights = voronoi_weights[np.newaxis, :].repeat(raw_data.shape[0], axis=0)  # Repeat to number of slices
     raw_data = raw_data * voronoi_weights
 
     # Get Kaiser-Bessel kernel
     kb_kernel = signal.kaiser(M, np.pi * L / 2)
 
     # Gridding
-    kgrid = np.zeros((raw_data.shape[1], xres, yres), dtype=complex)
-    for i_view, angle in enumerate(angles):
-        for i_x_ro in range(xres):
-            # x, y positions on cartesian grid centered at xres/2, yres/2
-            x = (i_x_ro - xres / 2) * math.cos(angle) + xres / 2
-            y = (i_x_ro - xres / 2) * math.sin(angle) + xres / 2
+    kgrid = np.zeros((raw_data.shape[0], xres, yres), dtype=complex)
+    for (ik, [x, y]) in enumerate(kspace_traj):
+        x1 = math.ceil(x - L / 2)  # Range (x1->x2, y1->y2) of points by convolution
+        x2 = math.floor(x + L / 2)
+        y1 = math.ceil(y - L / 2)
+        y2 = math.floor(y + L / 2)
 
-            x1 = math.ceil(x - L / 2)  # Range (x1->x2, y1->y2) of points by convolution
-            x2 = math.floor(x + L / 2)
-            y1 = math.ceil(y - L / 2)
-            y2 = math.floor(y + L / 2)
+        if x1 < 0:
+            x1 = 0
+        if x2 > xres - 1:
+            x2 = xres - 1
+        if y1 < 0:
+            y1 = 0
+        if y2 > yres - 1:
+            y2 = yres - 1
 
-            if x1 < 0:
-                x1 = 0
-            if x2 > xres - 1:
-                x2 = xres - 1
-            if y1 < 0:
-                y1 = 0
-            if y2 > yres - 1:
-                y2 = yres - 1
+        yy = y1  # Start convolution
+        while yy <= y2:
+            xx = x1
+            ay = round(abs(y - yy) * M / L + M / 2)
 
-            yy = y1  # Start convolution
-            while yy <= y2:
-                xx = x1
-                ay = round(abs(y - yy) * M / L + M / 2)
-
-                while xx <= x2:
-                    ax = round(abs(x - xx) * M / L + M / 2)
-                    if ay > M - 1:
-                        ay = M - 1
-                    if ax > M - 1:
-                        ax = M - 1
-                    # j = row (view) number, i = column number
-                    kgrid[:, yy, xx] += raw_data[i_view, :, i_x_ro] * kb_kernel[ax] * kb_kernel[ay]
-                    xx += 1
-                yy += 1
+            while xx <= x2:
+                ax = round(abs(x - xx) * M / L + M / 2)
+                if ay > M - 1:
+                    ay = M - 1
+                if ax > M - 1:
+                    ax = M - 1
+                # j = row (view) number, i = column number
+                kgrid[:, yy, xx] += raw_data[:, ik] * kb_kernel[ax] * kb_kernel[ay]
+                xx += 1
+            yy += 1
 
     if n_slices is None:
         kgrid = np.squeeze(kgrid)
@@ -532,7 +571,7 @@ def deapodization_filter(matrix_size, L=4):
     return d_filter
 
 
-def do_kspace_corrections(raw_data, quick_correct=True, ref_slice=None):
+def do_kspace_corrections(raw_data, angles=None, golden_angle=False, quick_correct=True, ref_slice=None):
     """
     Shifts views to the center of k-space, applies offset frequency correction, applies phase normalization.
     If quick_correct is False:
@@ -553,6 +592,8 @@ def do_kspace_corrections(raw_data, quick_correct=True, ref_slice=None):
         - raw_data: corrected radial k-space data with same shape as input
     """
 
+    # TODO: de-bug quick_correct=False.
+
     n_views = raw_data.shape[0]
     xres_ro = raw_data.shape[-1]
 
@@ -566,11 +607,12 @@ def do_kspace_corrections(raw_data, quick_correct=True, ref_slice=None):
         if ref_slice is None:  # use center slice (not ideal if actually 4D image, like DWI)
             ref_slice = raw_data.shape[1] // 2
         ref_raw_data = np.expand_dims(raw_data[:, ref_slice], axis=1)  # Preserve slice dimension
-        frequency_offset = get_frequency_offset(ref_raw_data)
+        frequency_offset = get_frequency_offset(ref_raw_data, angles=angles, golden_angle=golden_angle)
         kspace_peak_idxs = np.ones((raw_data.shape[:2])) * np.mean(
             get_kspace_centers(ref_raw_data))  # Same for all views
     else:
-        frequency_offset = get_frequency_offset(raw_data)
+        print('quick_correct=False not supported anymore. Will not return correct images.')
+        frequency_offset = get_frequency_offset(raw_data, angles=angles, golden_angle=golden_angle)
         kspace_peak_idxs = get_kspace_centers(raw_data)  # Size [views, slices]
 
     # Apply corrections
@@ -597,32 +639,14 @@ def do_kspace_corrections(raw_data, quick_correct=True, ref_slice=None):
 
 
 def reconstruct_image(raw_data, matrix_size,
-                      angles=None, golden_angle=False,  # Acquisition parameters
+                      kspace_traj=None, angles=None, golden_angle=False,  # Acquisition/sampling parameters
                       zerofill_factor=1, do_corrections=True, quick_correct=True, ref_slice=None,  # Correction params
-                      gridding_matrix=None, M=501, L=4,  # Reconstruction parameters
+                      gridding_matrix=None, M=501, L=4,  # Reconstruction/gridding parameters
                       return_complex=False, return_cropped=True,  # Return parameters
                       ):
-    """
-    Reconstructs 2D or 3D image from radially acquired k-space data. Corrects k-space data prior to reconstruction by
-    shifting views to the center of k-space, phase normalizing, and correcting for offset frequency of opposite views.
-    Inputs:
-        - raw_data: 2D or 3D numpy array with radially acquired k-space data
-        - matrix_size: [xres, yres] of reconstructed image
-        - angles: 1D numpy array with angles of each view in radians. If None, assigned using get_angle_array()
-        - golden_angle: boolean, fed to get_angle_array() if "angles" is None
-        - zerofill_factor: factor by which FOV is increased (1: no zerofilling, 2: doubling, etc.)
-        - quick_correct: see do_kspace_corrections() documentation
-        - ref_slice: integer, reference slice used to compute k-space corrections for all slices.
-                     see do_kspace_corrections() documentation for specifics.
-        - M, L: Kaiser-Bessel convolution kernel parameters
-        - return_complex: boolean, whether the complex image is returned
-        - return_cropped: boolean. If k-space is zerofilled prior to reconstruction to increase FOV, whether image is
-                          cropped to original FOV prior to output
-    Outputs:
-        - image: 2D or 3D numpy array shape [(slices), yres, xres]. If zerofill_factor > 1 and return_cropped = False,
-                 shape is [(slices), yres*zerofill_factor, xres*zerofill_factor].
-    """
 
+    # TODO: CURRENTLY ASSUMES IF KSPACE_TRAJ IS PROVIDED, THAT IT IS IN CARTESIAN COORDINATES WITH THE ORIGIN AT BOTTOM LEFT OF K-SPACE.
+    # TODO: Maybe check if FOV zerofilling makes sense if not with a conventional radial scheme?
     xres, yres = matrix_size
 
     if len(raw_data.shape) < 3:
@@ -631,9 +655,21 @@ def reconstruct_image(raw_data, matrix_size,
     else:
         n_slices = raw_data.shape[1]  # Value not used
 
-    # k-space corrections and gridding to cartesian k-space
+    if kspace_traj is not None:
+        warnings.warn("\nPhase corrections and FOV zerofilling are only implemented for conventional radial scheme, "
+                      "i.e. where every view/spoke samples k-space from edge to edge.\n"
+                      "Your data must therefore already have k-space corrections applied.\n"
+                      "If you have not applied k-space corrections but your acquisition is in a conventional "
+                      "radial scheme, input your raw_data in the acquisition dimensions, i.e. (views, (slices), readout), "
+                      "and change kspace_traj=None.")
+        do_corrections = False
+        zerofill_factor = 1
+
     if do_corrections:
-        raw_data = do_kspace_corrections(raw_data, quick_correct=quick_correct, ref_slice=ref_slice)
+        print('Doing zeroth and first order phase corrections\n')
+        raw_data = do_kspace_corrections(raw_data,
+                                         angles=angles, golden_angle=golden_angle,
+                                         quick_correct=quick_correct, ref_slice=ref_slice)
 
     zf_bool = False
     if zerofill_factor > 1:
@@ -647,10 +683,9 @@ def reconstruct_image(raw_data, matrix_size,
             gridding_matrix = None
         else:
             kgrid = np.tensordot(raw_data, gridding_matrix, axes=((0, -1), (0, 1))).reshape((-1, matrix_size[0], matrix_size[1]))
-
     if gridding_matrix is None:
         kgrid = grid_to_cartesian(raw_data, matrix_size,
-                              angles=angles, golden_angle=golden_angle, M=M, L=L)  # Returns in [slices, xres, yres]
+                                  kspace_traj=kspace_traj, angles=angles, golden_angle=golden_angle, M=M, L=L)  # Returns in [slices, xres, yres]
 
     image = np.fft.fftshift(np.fft.ifft2(np.fft.fftshift(kgrid, axes=(1, 2))), axes=(1, 2))
 
